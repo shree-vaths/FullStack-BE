@@ -5,8 +5,9 @@ node_modules/
 dist/
 coverage/
 
-# Secrets: DATABASE_URL etc. Set them in Render's dashboard, never commit them.
-.env
+# Other env variants stay ignored. NOTE: `.env` itself is deliberately NOT
+# ignored in this repo (owner's decision), so it is committed with DATABASE_URL.
+# Keep this repository private.
 .env.*
 
 # SQLite runtime side files (the database itself, data/app.db, is committed)
