@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { parseCorsOrigins } from './corsOrigins';
 
 /**
  * All runtime configuration lives here, read once from the environment with
@@ -34,7 +35,16 @@ function requireEnv(name: string): string {
   return value;
 }
 
+/** The deployed frontend; the default CORS allow-list when CORS_ORIGINS isn't set. */
+const DEFAULT_CORS_ORIGINS = 'https://fullstack-fe.onrender.com';
+
 export const config = {
+  /**
+   * Frontend origins allowed to call this API from the browser (CORS).
+   * Comma-separated, e.g. "https://fullstack-fe.onrender.com,https://my-app.vercel.app".
+   * Not needed for local dev: the Vite dev server proxies /api (same origin).
+   */
+  corsOrigins: parseCorsOrigins(process.env.CORS_ORIGINS ?? DEFAULT_CORS_ORIGINS),
   port: parsePort(process.env.PORT, 3001),
   /** Postgres connection string, e.g. the Supabase "Session pooler" URL. */
   databaseUrl: requireEnv('DATABASE_URL'),

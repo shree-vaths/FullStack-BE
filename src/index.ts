@@ -35,7 +35,10 @@ async function start(): Promise<void> {
     db = await openDatabase({ connectionString: config.databaseUrl, ssl: config.databaseSsl });
     // Also confirms the tables exist (see supabase/supabase_setup.sql).
     await warnIfEmpty(db);
-    server = http.createServer(createApp(db));
+    server = http.createServer(createApp(db, { corsOrigins: config.corsOrigins }));
+    console.log(
+      `CORS allowed origins: ${config.corsOrigins.join(', ') || '(none: same-origin only)'}`,
+    );
   } catch (error) {
     fail('could not initialise the database or the app', error);
   }

@@ -1,3 +1,4 @@
+import cors from 'cors';
 import express, { type Express } from 'express';
 import { isDatabaseHealthy, type Db } from './db/connection';
 import { DB_RETRY_AFTER_SECONDS } from './errors/AppError';
@@ -8,13 +9,22 @@ import { createUserRepository } from './repositories/userRepository';
 import { createUserRouter } from './routes/userRoutes';
 import { createUserService } from './services/userService';
 
+export interface AppOptions {
+  /**
+   * Browser origins allowed to call the API cross-origin (CORS), e.g.
+   * ["https://fullstack-fe.onrender.com"]. Empty = same-origin only.
+   */
+  corsOrigins?: string[];
+}
+
 /**
  * Composition root: builds the app by wiring db -> repositories -> services -> routes.
  *
- * The database is passed in rather than imported, so tests can hand in an
- * in-process Postgres (PGlite), and building the app never has side effects like opening a port.
+ * The database and options are passed in rather than imported, so tests can
+ * hand in an in-process Postgres (PGlite) and their own CORS list, and building
+ * the app never has side effects like opening a port.
  */
-export function createApp(db: Db): Express {
+export function createApp(db: Db, options: AppOptions = {}): Express {
   const userService = createUserService({
     users: createUserRepository(db),
     transactions: createTransactionRepository(db),
@@ -22,6 +32,23 @@ export function createApp(db: Db): Express {
 
   const app = express();
   app.disable('x-powered-by'); // don't advertise the framework to clients
+
+  // CORS: lets the deployed frontend (a different origin) call this API from
+  // the browser. Registered first so it also covers errors and 404s; otherwise
+  // the browser would hide those responses and report a CORS failure instead.
+  // A request from an origin not on the list gets no CORS headers, so the
+  // browser blocks it. (CORS only restricts browsers; it is not
+  // authentication: curl and servers can still call the API.)
+  app.use(
+    cors({
+      origin: options.corsOrigins ?? [],
+      methods: ['GET'], // the API is read-only
+      // Cross-origin JS can only read "simple" response headers unless they are
+      // exposed; the client's retry logic needs Retry-After on 503s.
+      exposedHeaders: ['Retry-After'],
+      maxAge: 600, // let browsers cache the preflight answer for 10 minutes
+    }),
+  );
 
   // Reports whether the app can actually reach its database, so a load
   // balancer / uptime check can take an unhealthy instance out of rotation.
