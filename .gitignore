@@ -1,0 +1,20 @@
+# Dependencies (restore with `npm install`)
+node_modules/
+
+# Build / test output
+dist/
+coverage/
+
+# Secrets: DATABASE_URL etc. Set them in Render's dashboard, never commit them.
+.env
+.env.*
+
+# SQLite runtime side files (the database itself, data/app.db, is committed)
+*.db-wal
+*.db-shm
+
+# Logs, OS / editor files
+*.log
+.DS_Store
+.vscode/
+.idea/
