@@ -10,10 +10,6 @@ coverage/
 # Keep this repository private.
 .env.*
 
-# SQLite runtime side files (the database itself, data/app.db, is committed)
-*.db-wal
-*.db-shm
-
 # Logs, OS / editor files
 *.log
 .DS_Store

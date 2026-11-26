@@ -12,7 +12,7 @@ import { createUserService } from './services/userService';
  * Composition root: builds the app by wiring db -> repositories -> services -> routes.
  *
  * The database is passed in rather than imported, so tests can hand in an
- * in-memory DB, and building the app never has side effects like opening a port.
+ * in-process Postgres (PGlite), and building the app never has side effects like opening a port.
  */
 export function createApp(db: Db): Express {
   const userService = createUserService({
@@ -25,8 +25,8 @@ export function createApp(db: Db): Express {
 
   // Reports whether the app can actually reach its database, so a load
   // balancer / uptime check can take an unhealthy instance out of rotation.
-  app.get('/api/health', (_req, res) => {
-    if (isDatabaseHealthy(db)) {
+  app.get('/api/health', async (_req, res) => {
+    if (await isDatabaseHealthy(db)) {
       res.json({ data: { status: 'ok', database: 'ok' } });
       return;
     }

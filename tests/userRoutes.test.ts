@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import request from 'supertest';
 import type { Express } from 'express';
 import {
@@ -9,18 +9,22 @@ import {
   type User,
 } from '../src/types';
 import { createApp } from '../src/app';
-import { openDatabase, type Db } from '../src/db/connection';
 import { seedDatabase } from '../src/db/seedData';
+import { createTestDb, resetSchema, type TestDb } from './testDb';
 
 /**
- * API tests against a fresh in-memory database per test: fast, isolated,
- * and exercising the real SQL rather than mocks.
+ * API tests against a real (in-process) Postgres, reset and reseeded before
+ * each test: isolated, and exercising the real SQL rather than mocks.
  */
 
 const USER_COUNT = 25; // > DEFAULT_PAGE_SIZE, so the users list spans 2 pages
 
 /** Asserts `values` never go "backwards" for the given direction. */
-function expectSorted<T>(values: T[], order: 'asc' | 'desc', key: (v: T) => string | number = String) {
+function expectSorted<T>(
+  values: T[],
+  order: 'asc' | 'desc',
+  key: (v: T) => string | number = String,
+) {
   for (let i = 1; i < values.length; i++) {
     const [prev, curr] = [key(values[i - 1]!), key(values[i]!)];
     if (order === 'asc') expect(prev <= curr, `${prev} should come before ${curr}`).toBe(true);
@@ -29,16 +33,24 @@ function expectSorted<T>(values: T[], order: 'asc' | 'desc', key: (v: T) => stri
 }
 
 describe('/api/users', () => {
-  let db: Db;
+  let db: TestDb;
   let app: Express;
 
-  beforeEach(() => {
-    db = openDatabase(':memory:');
-    seedDatabase(db, { userCount: USER_COUNT, transactionCount: 300, minTransactionsPerUser: 10 });
+  beforeAll(async () => {
+    db = await createTestDb();
     app = createApp(db);
   });
 
-  afterEach(() => db.close());
+  beforeEach(async () => {
+    await resetSchema(db);
+    await seedDatabase(db, {
+      userCount: USER_COUNT,
+      transactionCount: 300,
+      minTransactionsPerUser: 10,
+    });
+  });
+
+  afterAll(() => db.close());
 
   const getPage = async <T>(url: string): Promise<ApiPage<T>> =>
     (await request(app).get(url).expect(200)).body;
@@ -86,7 +98,9 @@ describe('/api/users', () => {
     });
 
     it.each(['asc', 'desc'] as const)('sorts by name %s, case-insensitively', async (order) => {
-      const { data } = await getPage<User>(`/api/users?sortBy=name&sortOrder=${order}&pageSize=100`);
+      const { data } = await getPage<User>(
+        `/api/users?sortBy=name&sortOrder=${order}&pageSize=100`,
+      );
       expectSorted(data, order, (u) => u.name.toLowerCase());
     });
 
@@ -129,21 +143,23 @@ describe('/api/users', () => {
   });
 
   describe('GET /api/users/:id/transactions', () => {
-    const totalFor = (userId: number) =>
-      db
-        .prepare<[number], { n: number }>(`SELECT COUNT(*) AS n FROM transactions WHERE user_id = ?`)
-        .get(userId)!.n;
+    const totalFor = async (userId: number) =>
+      (
+        await db.query<{ n: number }>(`SELECT COUNT(*) AS n FROM transactions WHERE user_id = $1`, [
+          userId,
+        ])
+      )[0]!.n;
 
     it("returns only that user's transactions, newest first, with pagination", async () => {
       const body = await getPage<Transaction>('/api/users/1/transactions');
 
       expect(body.data.every((t) => t.userId === 1)).toBe(true);
       expectSorted(body.data, 'desc', (t) => t.serviceDate);
-      expect(body.pagination.totalItems).toBe(totalFor(1));
+      expect(body.pagination.totalItems).toBe(await totalFor(1));
     });
 
-    it('pages through all of a user\'s transactions', async () => {
-      const total = totalFor(1);
+    it("pages through all of a user's transactions", async () => {
+      const total = await totalFor(1);
       const pageSize = 3;
       const pages = Math.ceil(total / pageSize);
 
@@ -166,7 +182,7 @@ describe('/api/users', () => {
     });
 
     it('returns an empty page for a user with no transactions', async () => {
-      db.prepare(`DELETE FROM transactions WHERE user_id = 1`).run();
+      await db.query(`DELETE FROM transactions WHERE user_id = 1`);
       const body = await getPage<Transaction>('/api/users/1/transactions');
       expect(body.data).toEqual([]);
       expect(body.pagination).toMatchObject({ totalItems: 0, totalPages: 0 });

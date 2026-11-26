@@ -1,19 +1,48 @@
-import fs from 'node:fs';
-import path from 'node:path';
-import { fileURLToPath } from 'node:url';
-import Database from 'better-sqlite3';
-
-export type Db = Database.Database;
-
-const SCHEMA_PATH = path.join(path.dirname(fileURLToPath(import.meta.url)), 'schema.sql');
+import pg from 'pg';
 
 /**
- * How long a query waits for another connection's lock (e.g. the seed script
- * writing while the server reads) before failing with SQLITE_BUSY.
+ * The database as the rest of the app sees it: run a query, run several in
+ * one transaction, close. Kept this small so tests can supply an in-process
+ * Postgres (PGlite) behind the same interface instead of a network server.
  */
-const BUSY_TIMEOUT_MS = 5_000;
+export interface Queryable {
+  /** Runs one statement with `$1, $2, ...` placeholders bound to `params`. */
+  query<Row extends object>(sql: string, params?: unknown[]): Promise<Row[]>;
+}
 
-/** The database could not be opened or prepared for use. Raised at startup, not per request. */
+export interface Db extends Queryable {
+  /** False once `close()` has been called. */
+  readonly isOpen: boolean;
+  /**
+   * Runs `fn` inside one transaction: committed if it resolves, rolled back if it throws.
+   * `readOnly` uses REPEATABLE READ, so every query in `fn` sees the same snapshot.
+   */
+  transaction<T>(fn: (tx: Queryable) => Promise<T>, options?: { readOnly?: boolean }): Promise<T>;
+  close(): Promise<void>;
+}
+
+export interface DatabaseOptions {
+  connectionString: string;
+  /** Encrypt the connection (required by Supabase). */
+  ssl: boolean;
+}
+
+// Return BIGINT ids/counts as numbers (pg defaults to strings to avoid
+// overflow; ours stay far below 2^53) and DATE columns as plain "YYYY-MM-DD"
+// strings (pg's default Date object would shift with the server's time zone).
+pg.types.setTypeParser(pg.types.builtins.INT8, Number);
+pg.types.setTypeParser(pg.types.builtins.DATE, (value) => value);
+
+/** Connections kept open to the database. Supabase's pooler caps them per project. */
+const POOL_SIZE = 5;
+/** Fail a request instead of hanging when no connection can be made. */
+const CONNECT_TIMEOUT_MS = 5_000;
+/** Server-side cap on a single statement, so a runaway query can't hold a connection. */
+const STATEMENT_TIMEOUT_MS = 10_000;
+
+const READ_ONLY_BEGIN = 'BEGIN ISOLATION LEVEL REPEATABLE READ, READ ONLY';
+
+/** The database could not be reached or used. Raised at startup, not per request. */
 export class DatabaseConnectionError extends Error {
   constructor(message: string, options: { cause: unknown }) {
     super(message, options);
@@ -21,61 +50,91 @@ export class DatabaseConnectionError extends Error {
   }
 }
 
+/** "host:port" of a connection string, for messages. Never includes the password. */
+function describeTarget(connectionString: string): string {
+  try {
+    const url = new URL(connectionString);
+    return `${url.hostname}:${url.port || 5432}`;
+  } catch {
+    return '(invalid DATABASE_URL)';
+  }
+}
+
+/** Wraps a pg connection pool in the Db interface. */
+function createPostgresDb({ connectionString, ssl }: DatabaseOptions): Db {
+  const pool = new pg.Pool({
+    connectionString,
+    // Encrypted, but the certificate isn't checked against a CA: Supabase
+    // signs with its own CA, which Node doesn't trust by default.
+    ssl: ssl ? { rejectUnauthorized: false } : false,
+    max: POOL_SIZE,
+    connectionTimeoutMillis: CONNECT_TIMEOUT_MS,
+    statement_timeout: STATEMENT_TIMEOUT_MS,
+  });
+  // An idle connection dropped by the server (e.g. a pooler restart) is
+  // reported here. Without a listener Node would crash the process; the pool
+  // simply opens a new connection next time.
+  pool.on('error', (error) => console.error('Idle database connection failed:', error));
+
+  const query: Queryable['query'] = async (sql, params) => (await pool.query(sql, params)).rows;
+
+  return {
+    get isOpen() {
+      return !pool.ending;
+    },
+    query,
+    async transaction(fn, options) {
+      const client = await pool.connect();
+      try {
+        await client.query(options?.readOnly ? READ_ONLY_BEGIN : 'BEGIN');
+        const result = await fn({
+          query: async (sql, params) => (await client.query(sql, params)).rows,
+        });
+        await client.query('COMMIT');
+        client.release();
+        return result;
+      } catch (error) {
+        // If ROLLBACK fails too, the connection is unusable: destroy it
+        // rather than returning it to the pool.
+        await client.query('ROLLBACK').then(
+          () => client.release(),
+          (rollbackError: Error) => client.release(rollbackError),
+        );
+        throw error;
+      }
+    },
+    close: () => pool.end(),
+  };
+}
+
 /**
- * Opens a SQLite database and ensures the schema exists.
+ * Connects to Postgres and checks the connection works.
  *
  * Fails fast with a DatabaseConnectionError (original error attached as
- * `cause`) instead of letting the server start against an unusable database.
- *
- * @param filePath Path to the DB file, or ':memory:' for an isolated in-memory DB (used by tests).
+ * `cause`) instead of letting the server start against an unreachable database.
  */
-export function openDatabase(filePath: string): Db {
-  const inMemory = filePath === ':memory:';
-
-  // Step 1: open the file. Fails on e.g. missing permissions, a directory that
-  // can't be created, or a path that points at a directory.
-  let db: Db;
+export async function openDatabase(options: DatabaseOptions): Promise<Db> {
+  const db = createPostgresDb(options);
   try {
-    if (!inMemory) fs.mkdirSync(path.dirname(filePath), { recursive: true });
-    db = new Database(filePath, { timeout: BUSY_TIMEOUT_MS });
-  } catch (error) {
-    throw new DatabaseConnectionError(`Could not open the database at "${filePath}"`, {
-      cause: error,
-    });
-  }
-
-  // Step 2: configure it and apply the schema. SQLite opens files lazily, so a
-  // corrupt or non-SQLite file only fails here, on the first real statement.
-  try {
-    // SQLite ships with foreign key enforcement OFF; it must be enabled per connection.
-    db.pragma('foreign_keys = ON');
-    // WAL lets reads proceed while a write is in progress (better concurrency for a web server).
-    if (!inMemory) db.pragma('journal_mode = WAL');
-    applySchema(db);
+    await db.query('SELECT 1');
     return db;
   } catch (error) {
-    // Don't leak the open file handle when initialisation fails.
-    db.close();
+    await db.close().catch(() => {});
     throw new DatabaseConnectionError(
-      `The database at "${filePath}" could not be initialised (corrupt file, not a SQLite database, or schema error)`,
+      `Could not connect to the database at ${describeTarget(options.connectionString)}`,
       { cause: error },
     );
   }
 }
 
-/** Idempotent: schema.sql only uses CREATE ... IF NOT EXISTS. */
-export function applySchema(db: Db): void {
-  db.exec(fs.readFileSync(SCHEMA_PATH, 'utf8'));
-}
-
 /**
- * Cheap liveness probe used by the health endpoint. Never throws:
- * returns false if the connection is closed or the file has become unreadable.
+ * Liveness probe used by the health endpoint. Never throws: returns false if
+ * the database is closed or can't be reached.
  */
-export function isDatabaseHealthy(db: Db): boolean {
+export async function isDatabaseHealthy(db: Db): Promise<boolean> {
+  if (!db.isOpen) return false;
   try {
-    // Reads the schema page, so it touches the file (unlike a bare `SELECT 1`).
-    db.prepare('SELECT COUNT(*) FROM sqlite_master').get();
+    await db.query('SELECT 1');
     return true;
   } catch {
     return false;

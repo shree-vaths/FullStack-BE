@@ -4,7 +4,7 @@
  * knowing about individual cases. Anything that is NOT an AppError is treated
  * as an unexpected bug (500) and its details are hidden from the client.
  *
- * `cause` keeps the original low-level error (e.g. the SQLite error) attached
+ * `cause` keeps the original low-level error (e.g. the Postgres error) attached
  * for server logs, while `message` stays safe to show to clients.
  */
 export class AppError extends Error {
@@ -24,10 +24,9 @@ export class AppError extends Error {
 }
 
 /**
- * Suggested wait before retrying a temporarily unavailable database. Locks in
- * SQLite last milliseconds to seconds (we already waited up to the 5s busy
- * timeout), so a short pause is enough. Clients should still back off on
- * repeated failures.
+ * Suggested wait before retrying a temporarily unavailable database (dropped
+ * connection, pooler restart, too many connections). A short pause is usually
+ * enough; clients should still back off on repeated failures.
  */
 export const DB_RETRY_AFTER_SECONDS = 1;
 
@@ -46,9 +45,9 @@ export class ValidationError extends AppError {
 /**
  * A database operation failed while serving a request.
  *
- * - retryable (e.g. the DB is locked/busy): 503 DATABASE_UNAVAILABLE, so the
- *   client knows trying again shortly may succeed.
- * - otherwise (corrupt file, I/O error, missing table): 500 DATABASE_ERROR.
+ * - retryable (e.g. the DB is unreachable or overloaded): 503 DATABASE_UNAVAILABLE,
+ *   so the client knows trying again shortly may succeed.
+ * - otherwise (missing table, bad SQL, constraint violation): 500 DATABASE_ERROR.
  */
 export class DatabaseError extends AppError {
   readonly retryable: boolean;

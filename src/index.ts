@@ -1,8 +1,8 @@
 /**
- * Process entry point: opens the DB, starts the HTTP server, and shuts down cleanly.
+ * Process entry point: connects to the DB, starts the HTTP server, and shuts down cleanly.
  * Kept separate from app.ts so the app can be tested without listening on a port.
  *
- * Startup is fail-fast: if the database can't be opened or the port can't be
+ * Startup is fail-fast: if the database can't be reached or the port can't be
  * bound, log one clear message and exit with code 1, rather than running in a
  * half-working state.
  */
@@ -16,21 +16,25 @@ const SHUTDOWN_TIMEOUT_MS = 10_000;
 
 function fail(message: string, error: unknown): never {
   console.error(`Fatal: ${message}`);
-  console.error(error); // includes the `cause` chain, e.g. the underlying SQLite error
+  console.error(error); // includes the `cause` chain, e.g. the underlying Postgres error
   process.exit(1);
 }
 
-function warnIfEmpty(db: Db): void {
-  const row = db.prepare<[], { n: number }>(`SELECT COUNT(*) AS n FROM users`).get();
-  if (!row?.n) console.warn('Warning: the database has no users. Run `npm run seed` to add sample data.');
+async function warnIfEmpty(db: Db): Promise<void> {
+  const [row] = await db.query<{ n: number }>(`SELECT COUNT(*) AS n FROM users`);
+  if (!row?.n)
+    console.warn(
+      'Warning: the database has no users. Run `npm run seed -- --yes` to add sample data.',
+    );
 }
 
-function start(): void {
+async function start(): Promise<void> {
   let db: Db;
   let server: http.Server;
   try {
-    db = openDatabase(config.databasePath);
-    warnIfEmpty(db);
+    db = await openDatabase({ connectionString: config.databaseUrl, ssl: config.databaseSsl });
+    // Also confirms the tables exist (see supabase/supabase_setup.sql).
+    await warnIfEmpty(db);
     server = http.createServer(createApp(db));
   } catch (error) {
     fail('could not initialise the database or the app', error);
@@ -38,7 +42,7 @@ function start(): void {
 
   // Binding errors (port in use, no permission) arrive as an event, not a throw.
   server.on('error', (error: NodeJS.ErrnoException) => {
-    db.close();
+    void db.close();
     const reason =
       error.code === 'EADDRINUSE'
         ? `port ${config.port} is already in use (set PORT to use another)`
@@ -50,7 +54,7 @@ function start(): void {
     console.log(`API listening on http://localhost:${config.port}`);
   });
 
-  // Finish in-flight requests, then close the DB file cleanly on Ctrl+C / container stop.
+  // Finish in-flight requests, then close the DB pool on Ctrl+C / container stop.
   let shuttingDown = false;
   function shutdown(signal: string): void {
     if (shuttingDown) return; // a second Ctrl+C shouldn't start a second shutdown
@@ -63,11 +67,11 @@ function start(): void {
       process.exit(1);
     }, SHUTDOWN_TIMEOUT_MS).unref();
 
-    server.close((closeError) => {
+    server.close(async (closeError) => {
       let exitCode = closeError ? 1 : 0;
       if (closeError) console.error('Error while closing the HTTP server:', closeError);
       try {
-        db.close();
+        await db.close();
       } catch (error) {
         console.error('Error while closing the database:', error);
         exitCode = 1;
@@ -79,4 +83,4 @@ function start(): void {
   process.on('SIGTERM', () => shutdown('SIGTERM'));
 }
 
-start();
+void start();

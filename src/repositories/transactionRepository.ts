@@ -2,7 +2,7 @@ import type { Transaction, TransactionSortField } from '../types';
 import type { Db } from '../db/connection';
 import { withDbErrorHandling } from '../db/dbErrors';
 import { toLimitOffset, type ListQuery, type PageResult } from '../pagination';
-import { createStatementCache, orderByClause } from './sqlHelpers';
+import { orderByClause } from './sqlHelpers';
 
 /** Data access for transactions. Mirrors userRepository's structure. */
 
@@ -32,35 +32,37 @@ const SORT_COLUMNS: Record<TransactionSortField, string> = {
 };
 
 export interface TransactionRepository {
-  findPageByUserId(userId: number, query: ListQuery<TransactionSortField>): PageResult<Transaction>;
+  findPageByUserId(
+    userId: number,
+    query: ListQuery<TransactionSortField>,
+  ): Promise<PageResult<Transaction>>;
 }
 
 export function createTransactionRepository(db: Db): TransactionRepository {
-  // Both queries filter on user_id and use idx_transactions_user_id.
-  const countByUserId = db.prepare<[number], { total: number }>(
-    `SELECT COUNT(*) AS total FROM transactions WHERE user_id = ?`,
-  );
-  const preparePage = createStatementCache<
-    [userId: number, limit: number, offset: number],
-    TransactionRow
-  >(db);
-
   // Same pattern as userRepository.findPage: rows + total in one snapshot.
-  const findPageByUserId = db.transaction(
-    (userId: number, query: ListQuery<TransactionSortField>): PageResult<Transaction> => {
-      const { limit, offset } = toLimitOffset(query);
-      const rows = preparePage(
-        `SELECT ${COLUMNS} FROM transactions
-          WHERE user_id = ?
-          ${orderByClause(SORT_COLUMNS, query.sortBy, query.sortOrder)}
-          LIMIT ? OFFSET ?`,
-      ).all(userId, limit, offset);
-      return {
-        items: rows.map(toTransaction),
-        totalItems: countByUserId.get(userId)?.total ?? 0,
-      };
-    },
-  );
+  // Both queries filter on user_id and use idx_transactions_user_id_service_date.
+  const findPageByUserId = (
+    userId: number,
+    query: ListQuery<TransactionSortField>,
+  ): Promise<PageResult<Transaction>> =>
+    db.transaction(
+      async (tx) => {
+        const { limit, offset } = toLimitOffset(query);
+        const rows = await tx.query<TransactionRow>(
+          `SELECT ${COLUMNS} FROM transactions
+            WHERE user_id = $1
+            ${orderByClause(SORT_COLUMNS, query.sortBy, query.sortOrder)}
+            LIMIT $2 OFFSET $3`,
+          [userId, limit, offset],
+        );
+        const [count] = await tx.query<{ total: number }>(
+          `SELECT COUNT(*) AS total FROM transactions WHERE user_id = $1`,
+          [userId],
+        );
+        return { items: rows.map(toTransaction), totalItems: count?.total ?? 0 };
+      },
+      { readOnly: true },
+    );
 
   return {
     findPageByUserId: withDbErrorHandling(db, 'list transactions', findPageByUserId),

@@ -1,5 +1,3 @@
-import type { Statement } from 'better-sqlite3';
-import type { Db } from '../db/connection';
 import type { SortOrder } from '../types';
 
 /** Small SQL utilities shared by the repositories. */
@@ -19,22 +17,4 @@ export function orderByClause<Field extends string>(
 ): string {
   const direction = sortOrder === 'asc' ? 'ASC' : 'DESC';
   return `ORDER BY ${columns[sortBy]} ${direction}, id ${direction}`;
-}
-
-/**
- * Returns a `prepare` that compiles each distinct SQL string once and reuses it.
- * Used where the SQL varies (e.g. by sort order) but only over a small, fixed set.
- */
-export function createStatementCache<Params extends unknown[], Row>(
-  db: Db,
-): (sql: string) => Statement<Params, Row> {
-  const cache = new Map<string, Statement<Params, Row>>();
-  return (sql) => {
-    let statement = cache.get(sql);
-    if (!statement) {
-      statement = db.prepare<Params, Row>(sql);
-      cache.set(sql, statement);
-    }
-    return statement;
-  };
 }

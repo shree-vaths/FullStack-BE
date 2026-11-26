@@ -4,7 +4,7 @@ import type { Db } from './connection';
 
 /**
  * Fake-data generation, kept separate from the CLI entry point (seed.ts) so
- * tests can seed an in-memory database with the exact same logic.
+ * tests can seed their in-process database with the exact same logic.
  */
 
 export interface SeedOptions {
@@ -37,7 +37,7 @@ function assignTransactionOwners<T>(users: T[], total: number, minPerUser: numbe
 }
 
 /** Replaces all data in the database with freshly generated fake data. */
-export function seedDatabase(db: Db, options: SeedOptions): void {
+export async function seedDatabase(db: Db, options: SeedOptions): Promise<void> {
   const { userCount, transactionCount, minTransactionsPerUser = 0, randomSeed = 42 } = options;
   // Fail before touching the DB if the numbers can't add up.
   if (userCount * minTransactionsPerUser > transactionCount) {
@@ -50,43 +50,50 @@ export function seedDatabase(db: Db, options: SeedOptions): void {
   // Anchor "now" so the same seed produces identical dates regardless of when it runs.
   const referenceDate = new Date('2026-01-01T00:00:00Z');
 
-  const insertUser = db.prepare<[string, string, string, ServiceLevel]>(
-    `INSERT INTO users (name, registration_date, country, service_level) VALUES (?, ?, ?, ?)`,
-  );
-  const insertTransaction = db.prepare<[number, number, number, string]>(
-    `INSERT INTO transactions (user_id, service_id, price_cents, service_date) VALUES (?, ?, ?, ?)`,
-  );
-
-  // A single transaction makes the seed atomic (all-or-nothing) and much faster
-  // than letting SQLite commit (and fsync) after every insert.
-  const run = db.transaction(() => {
-    db.exec('DELETE FROM transactions; DELETE FROM users;');
-    // Reset AUTOINCREMENT counters so IDs start at 1 on every run.
-    db.exec(`DELETE FROM sqlite_sequence WHERE name IN ('users', 'transactions');`);
+  // One transaction makes the seed atomic: a failure part-way leaves the
+  // previous data untouched rather than half-replaced.
+  await db.transaction(async (tx) => {
+    // RESTART IDENTITY resets the id sequences so IDs start at 1 on every run.
+    await tx.query('TRUNCATE transactions, users RESTART IDENTITY');
 
     const users: { id: number; registeredAt: Date }[] = [];
     for (let i = 0; i < userCount; i++) {
-      const registeredAt = faker.date.past({ years: REGISTRATION_WINDOW_YEARS, refDate: referenceDate });
-      const result = insertUser.run(
-        faker.person.fullName(),
-        toIsoDate(registeredAt),
-        faker.location.country(),
-        faker.helpers.arrayElement(SERVICE_LEVELS),
+      const registeredAt = faker.date.past({
+        years: REGISTRATION_WINDOW_YEARS,
+        refDate: referenceDate,
+      });
+      const [row] = await tx.query<{ id: number }>(
+        `INSERT INTO users (name, registration_date, country, service_level)
+         VALUES ($1, $2, $3, $4) RETURNING id`,
+        [
+          faker.person.fullName(),
+          toIsoDate(registeredAt),
+          faker.location.country(),
+          faker.helpers.arrayElement<ServiceLevel>(SERVICE_LEVELS),
+        ],
       );
-      users.push({ id: Number(result.lastInsertRowid), registeredAt });
+      users.push({ id: row!.id, registeredAt });
     }
 
+    const columns = {
+      userId: [] as number[],
+      serviceId: [] as number[],
+      priceCents: [] as number[],
+      serviceDate: [] as string[],
+    };
     for (const user of assignTransactionOwners(users, transactionCount, minTransactionsPerUser)) {
       // Keep data plausible: a user can't receive a service before they registered.
       const serviceDate = faker.date.between({ from: user.registeredAt, to: referenceDate });
-      insertTransaction.run(
-        user.id,
-        faker.number.int({ min: 1, max: SERVICE_ID_COUNT }),
-        faker.number.int({ min: MIN_PRICE_CENTS, max: MAX_PRICE_CENTS }),
-        toIsoDate(serviceDate),
-      );
+      columns.userId.push(user.id);
+      columns.serviceId.push(faker.number.int({ min: 1, max: SERVICE_ID_COUNT }));
+      columns.priceCents.push(faker.number.int({ min: MIN_PRICE_CENTS, max: MAX_PRICE_CENTS }));
+      columns.serviceDate.push(toIsoDate(serviceDate));
     }
+    // All transactions in one statement (one round trip) by passing each column as an array.
+    await tx.query(
+      `INSERT INTO transactions (user_id, service_id, price_cents, service_date)
+       SELECT * FROM unnest($1::bigint[], $2::int[], $3::int[], $4::date[])`,
+      [columns.userId, columns.serviceId, columns.priceCents, columns.serviceDate],
+    );
   });
-
-  run();
 }

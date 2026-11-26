@@ -2,14 +2,14 @@ import type { ServiceLevel, User, UserSortField } from '../types';
 import type { Db } from '../db/connection';
 import { withDbErrorHandling } from '../db/dbErrors';
 import { toLimitOffset, type ListQuery, type PageResult } from '../pagination';
-import { createStatementCache, orderByClause } from './sqlHelpers';
+import { orderByClause } from './sqlHelpers';
 
 /**
  * Data access for users. This is the only place that knows the `users` table
  * layout; everything above it works with the `User` domain type.
  */
 
-/** Row shape exactly as SQLite returns it (snake_case). */
+/** Row shape exactly as Postgres returns it (snake_case). */
 interface UserRow {
   id: number;
   name: string;
@@ -31,43 +31,48 @@ const COLUMNS = 'id, name, registration_date, country, service_level';
 /** API sort field -> SQL expression (the allow-list used by orderByClause). */
 const SORT_COLUMNS: Record<UserSortField, string> = {
   id: 'id',
-  name: 'name COLLATE NOCASE', // "alice" and "Bob" sort the way a person expects
+  name: 'lower(name)', // "alice" and "Bob" sort the way a person expects; matches idx_users_name
   registrationDate: 'registration_date',
 };
 
 export interface UserRepository {
-  findPage(query: ListQuery<UserSortField>): PageResult<User>;
-  findById(id: number): User | undefined;
+  findPage(query: ListQuery<UserSortField>): Promise<PageResult<User>>;
+  findById(id: number): Promise<User | undefined>;
 }
 
 export function createUserRepository(db: Db): UserRepository {
   // Values are always bound as parameters (never string-concatenated), which
-  // prevents SQL injection. Statements are prepared once and reused.
-  const selectById = db.prepare<[number], UserRow>(`SELECT ${COLUMNS} FROM users WHERE id = ?`);
-  const countAll = db.prepare<[], { total: number }>(`SELECT COUNT(*) AS total FROM users`);
-  const preparePage = createStatementCache<[limit: number, offset: number], UserRow>(db);
+  // prevents SQL injection.
 
-  // Page + count run in one read transaction, so the total always describes
-  // the same snapshot as the rows, even if a write lands in between.
+  // Page + count run in one read-only snapshot, so the total always describes
+  // the same data as the rows, even if a write lands in between.
   // NOTE: OFFSET gets slower for deep pages of large tables; keyset (cursor)
   // pagination is the scale-up path (Part 3).
-  const findPage = db.transaction((query: ListQuery<UserSortField>): PageResult<User> => {
-    const { limit, offset } = toLimitOffset(query);
-    const rows = preparePage(
-      `SELECT ${COLUMNS} FROM users
-        ${orderByClause(SORT_COLUMNS, query.sortBy, query.sortOrder)}
-        LIMIT ? OFFSET ?`,
-    ).all(limit, offset);
-    return { items: rows.map(toUser), totalItems: countAll.get()?.total ?? 0 };
-  });
+  const findPage = (query: ListQuery<UserSortField>): Promise<PageResult<User>> =>
+    db.transaction(
+      async (tx) => {
+        const { limit, offset } = toLimitOffset(query);
+        const rows = await tx.query<UserRow>(
+          `SELECT ${COLUMNS} FROM users
+            ${orderByClause(SORT_COLUMNS, query.sortBy, query.sortOrder)}
+            LIMIT $1 OFFSET $2`,
+          [limit, offset],
+        );
+        const [count] = await tx.query<{ total: number }>(`SELECT COUNT(*) AS total FROM users`);
+        return { items: rows.map(toUser), totalItems: count?.total ?? 0 };
+      },
+      { readOnly: true },
+    );
 
-  // Every public method is wrapped, so any SQLite failure reaches callers as a
-  // DatabaseError (503 if retryable, else 500) with a client-safe message.
+  const findById = async (id: number): Promise<User | undefined> => {
+    const [row] = await db.query<UserRow>(`SELECT ${COLUMNS} FROM users WHERE id = $1`, [id]);
+    return row ? toUser(row) : undefined;
+  };
+
+  // Every public method is wrapped, so any database failure reaches callers as
+  // a DatabaseError (503 if retryable, else 500) with a client-safe message.
   return {
     findPage: withDbErrorHandling(db, 'list users', findPage),
-    findById: withDbErrorHandling(db, 'load the user', (id: number) => {
-      const row = selectById.get(id);
-      return row ? toUser(row) : undefined;
-    }),
+    findById: withDbErrorHandling(db, 'load the user', findById),
   };
 }

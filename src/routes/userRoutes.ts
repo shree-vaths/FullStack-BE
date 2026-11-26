@@ -33,23 +33,25 @@ export function createUserRouter(userService: UserService): Router {
   const router = Router();
 
   // GET /api/users?page=&pageSize=&sortBy=id|name|registrationDate&sortOrder=asc|desc
-  router.get('/', (req, res) => {
+  router.get('/', async (req, res) => {
     const query = parseOrThrow(usersQuery, req.query);
-    const body: ApiPage<User> = toApiPage(userService.listUsers(query));
+    const body: ApiPage<User> = toApiPage(await userService.listUsers(query));
     res.json(body);
   });
 
-  router.get('/:id', (req, res) => {
+  router.get('/:id', async (req, res) => {
     const { id } = parseOrThrow(idParamSchema, req.params);
-    const body: ApiSuccess<User> = { data: userService.getUser(id) };
+    const body: ApiSuccess<User> = { data: await userService.getUser(id) };
     res.json(body);
   });
 
   // GET /api/users/:id/transactions?page=&pageSize=&sortBy=id|serviceDate|priceCents&sortOrder=asc|desc
-  router.get('/:id/transactions', (req, res) => {
+  router.get('/:id/transactions', async (req, res) => {
     const { id } = parseOrThrow(idParamSchema, req.params);
     const query = parseOrThrow(transactionsQuery, req.query);
-    const body: ApiPage<Transaction> = toApiPage(userService.listTransactionsForUser(id, query));
+    const body: ApiPage<Transaction> = toApiPage(
+      await userService.listTransactionsForUser(id, query),
+    );
     res.json(body);
   });
 

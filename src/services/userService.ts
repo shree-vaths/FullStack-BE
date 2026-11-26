@@ -10,9 +10,12 @@ import type { UserRepository } from '../repositories/userRepository';
  * It is deliberately thin today; it is where authorization/tenant checks would go.
  */
 export interface UserService {
-  listUsers(query: ListQuery<UserSortField>): Page<User>;
-  getUser(id: number): User;
-  listTransactionsForUser(userId: number, query: ListQuery<TransactionSortField>): Page<Transaction>;
+  listUsers(query: ListQuery<UserSortField>): Promise<Page<User>>;
+  getUser(id: number): Promise<User>;
+  listTransactionsForUser(
+    userId: number,
+    query: ListQuery<TransactionSortField>,
+  ): Promise<Page<Transaction>>;
 }
 
 export function createUserService(deps: {
@@ -21,19 +24,19 @@ export function createUserService(deps: {
 }): UserService {
   const { users, transactions } = deps;
 
-  const getUser = (id: number): User => {
-    const user = users.findById(id);
+  const getUser = async (id: number): Promise<User> => {
+    const user = await users.findById(id);
     if (!user) throw new NotFoundError(`User ${id} not found`);
     return user;
   };
 
   return {
-    listUsers: (query) => toPage(users.findPage(query), query),
+    listUsers: async (query) => toPage(await users.findPage(query), query),
     getUser,
-    listTransactionsForUser: (userId, query) => {
+    listTransactionsForUser: async (userId, query) => {
       // Distinguishes "unknown user" (404) from "user with no transactions" (empty page).
-      getUser(userId);
-      return toPage(transactions.findPageByUserId(userId, query), query);
+      await getUser(userId);
+      return toPage(await transactions.findPageByUserId(userId, query), query);
     },
   };
 }
